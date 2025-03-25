@@ -1,269 +1,426 @@
-"""
-Airport Passenger Processing Simulation.
-
-This is the main simulation runner that ties all components together.
-"""
-
-import os
+import simpy
 import random
 import numpy as np
-import simpy
-import argparse
+import pandas as pd
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict
+import json
 from datetime import datetime
+import os
 
-# Import configuration
-from config import RANDOM_SEED, SIM_TIME, SCENARIOS, HOURLY_ARRIVAL_RATES
+@dataclass
+class SimulationConfig:
+    # Arrival parameters
+    MEAN_ARRIVAL_TIME: float = 1/116  # minutes between arrivals (7000 passengers/hour)
+    SIMULATION_TIME: float = 1440  # 24 hours in minutes
+    
+    # Passenger mix
+    BUSINESS_CLASS_PROB: float = 0.05
+    LUGGAGE_PROB: float = 0.7
+    
+    # Service times (minutes)
+    CHECKIN_COUNTER_TIME_MEAN: float = 3
+    CHECKIN_KIOSK_TIME_MEAN: float = 2
+    SECURITY_TIME_MEAN: float = 0.5
+    DETAILED_SECURITY_TIME_MEAN: float = 3
+    BOARDING_TIME_MEAN: float = 1
+    
+    # Probabilities
+    DETAILED_SECURITY_PROB: float = 0.1
+    JOCKEY_PROB: float = 0.3
+    
+    # Resource counts
+    REGULAR_COUNTERS: int = 275
+    BUSINESS_COUNTERS: int = 20
+    KIOSKS: int = 90
+    REGULAR_SECURITY_LANES: int = 95
+    BUSINESS_SECURITY_LANES: int = 10
+    BOARDING_GATES: int = 118
 
-# Import stages
-from stages.arrival import ArrivalProcess
-from stages.check_in import CheckInStage
-from stages.security import SecurityStage
-from stages.boarding import BoardingStage
-
-# Import utilities
-from utils.metrics import MetricsCollector
-from utils.visualization import create_visualization_report
-
-def run_simulation(scenario_name="base", output_dir="results"):
-    """
-    Run the airport passenger processing simulation.
-    
-    Args:
-        scenario_name: Name of the scenario to run
-        output_dir: Directory to save results
-    """
-    print(f"Running simulation with scenario: {scenario_name}")
-    
-    # Set random seed for reproducibility
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-    
-    # Create SimPy environment
-    env = simpy.Environment()
-    
-    # Create metrics collector
-    metrics_collector = MetricsCollector()
-    
-    # Create stages in reverse order (boarding -> security -> check-in -> arrival)
-    # This is necessary because each stage needs a reference to the next stage
-    boarding_stage = BoardingStage(env, metrics_collector)
-    security_stage = SecurityStage(env, boarding_stage, metrics_collector)
-    check_in_stage = CheckInStage(env, security_stage, metrics_collector)
-    arrival_process = ArrivalProcess(env, check_in_stage, metrics_collector)
-    
-    # Apply scenario-specific configuration
-    apply_scenario_config(scenario_name, arrival_process, check_in_stage, security_stage, boarding_stage)
-    
-    # Run the simulation
-    env.run(until=SIM_TIME)
-    
-    # Update final time
-    metrics_collector.update_time(env.now)
-    
-    # Create output directory if it doesn't exist
-    scenario_output_dir = os.path.join(output_dir, scenario_name)
-    os.makedirs(scenario_output_dir, exist_ok=True)
-    
-    # Save metrics to CSV
-    metrics_collector.save_metrics_to_csv(os.path.join(scenario_output_dir, "metrics"))
-    
-    # Create visualization report
-    create_visualization_report(metrics_collector, scenario_output_dir)
-    
-    # Print summary
-    print_summary(metrics_collector, scenario_name)
-    
-    return metrics_collector
-
-def apply_scenario_config(scenario_name, arrival_process, check_in_stage, security_stage, boarding_stage):
-    """
-    Apply scenario-specific configuration to the simulation components.
-    
-    Args:
-        scenario_name: Name of the scenario to apply
-        arrival_process: ArrivalProcess instance
-        check_in_stage: CheckInStage instance
-        security_stage: SecurityStage instance
-        boarding_stage: BoardingStage instance
-    """
-    if scenario_name not in SCENARIOS:
-        print(f"Warning: Scenario '{scenario_name}' not found. Using base scenario.")
-        return
-    
-    scenario = SCENARIOS[scenario_name]
-    
-    # Apply scenario-specific configuration
-    if scenario_name == "staffing_low":
-        # Reduce staff at check-in and security
-        check_in_stage.economy_counters = simpy.Resource(check_in_stage.env, capacity=scenario.get("check_in_traditional_economy", 5))
-        security_stage.regular_document_check = simpy.Resource(security_stage.env, capacity=scenario.get("security_regular_lanes", 4))
-        security_stage.regular_scanning = simpy.Resource(security_stage.env, capacity=scenario.get("security_regular_lanes", 4))
-    
-    elif scenario_name == "staffing_high":
-        # Increase staff at check-in and security
-        check_in_stage.economy_counters = simpy.Resource(check_in_stage.env, capacity=scenario.get("check_in_traditional_economy", 12))
-        security_stage.regular_document_check = simpy.Resource(security_stage.env, capacity=scenario.get("security_regular_lanes", 8))
-        security_stage.regular_scanning = simpy.Resource(security_stage.env, capacity=scenario.get("security_regular_lanes", 8))
-    
-    elif scenario_name == "technology":
-        # More kiosks, express security
-        check_in_stage.kiosks = simpy.Resource(check_in_stage.env, capacity=scenario.get("kiosk_number", 10))
-        # Adjust security scanning time (in the service time calculation)
-        # This is handled dynamically in the _calculate_service_time method
-    
-    elif scenario_name == "high_demand":
-        # Increase arrival rate by modifying the arrival process
-        arrival_multiplier = scenario.get("arrival_rate_multiplier", 1.5)
+class Metrics:
+    def __init__(self):
+        self.queue_lengths = {
+            'checkin_regular': [],
+            'checkin_business': [],
+            'security_regular': [],
+            'security_business': [],
+            'boarding': []
+        }
+        self.utilization = {
+            'regular_counters': [],
+            'business_counters': [],
+            'kiosks': [],
+            'regular_security': [],
+            'business_security': [],
+            'boarding': []
+        }
+        self.timestamps = []
         
-        # Create a new dictionary with increased arrival rates
-        increased_rates = {}
-        for hour, rate in HOURLY_ARRIVAL_RATES.items():
-            increased_rates[hour] = rate * arrival_multiplier
+        # Tracking metrics
+        self.completed_passengers = 0
+        self.abandoned_passengers = 0
+        self.current_passengers = 0
+        self.throughput_per_hour = []
         
-        # Update the arrival process with the new rates
-        arrival_process.hourly_arrival_rates = increased_rates
-
-def print_summary(metrics_collector, scenario_name):
-    """
-    Print a summary of the simulation results.
-    
-    Args:
-        metrics_collector: MetricsCollector instance
-        scenario_name: Name of the scenario that was run
-    """
-    system_metrics = metrics_collector.get_system_metrics()
-    
-    print("\n" + "="*50)
-    print(f"Simulation Summary - Scenario: {scenario_name}")
-    print("="*50)
-    
-    print(f"\nPassenger Statistics:")
-    print(f"  Total Passengers: {system_metrics.get('total_passengers', 0)}")
-    print(f"  Completed Passengers: {system_metrics.get('completed_passengers', 0)}")
-    print(f"  Missed Flight Rate: {system_metrics.get('missed_flight_rate', 0):.2%}")
-    print(f"  Balking Rate: {system_metrics.get('balking_rate', 0):.2%}")
-    print(f"  Reneging Rate: {system_metrics.get('reneging_rate', 0):.2%}")
-    
-    print(f"\nProcessing Times (minutes):")
-    print(f"  Average Check-in Time: {system_metrics.get('avg_check_in_time', 0):.2f}")
-    print(f"  Average Security Time: {system_metrics.get('avg_security_time', 0):.2f}")
-    print(f"  Average Boarding Time: {system_metrics.get('avg_boarding_time', 0):.2f}")
-    print(f"  Average Total Time: {system_metrics.get('avg_total_time', 0):.2f}")
-    
-    print(f"\nThroughput:")
-    print(f"  Passengers Per Hour: {system_metrics.get('throughput_per_hour', 0):.2f}")
-    
-    print("\nResults saved to the 'results' directory.")
-    print("="*50 + "\n")
-
-def run_all_scenarios(output_dir="results"):
-    """
-    Run all defined scenarios and compare results.
-    
-    Args:
-        output_dir: Directory to save results
-    """
-    results = {}
-    
-    # Run each scenario
-    for scenario_name in SCENARIOS.keys():
-        results[scenario_name] = run_simulation(scenario_name, output_dir)
-    
-    # Create comparison report
-    create_comparison_report(results, output_dir)
-
-def create_comparison_report(results, output_dir):
-    """
-    Create a report comparing the results of different scenarios.
-    
-    Args:
-        results: Dictionary of MetricsCollector instances for each scenario
-        output_dir: Directory to save the report
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create comparison report
-    with open(os.path.join(output_dir, "scenario_comparison.txt"), "w") as f:
-        f.write("="*50 + "\n")
-        f.write("Scenario Comparison Report\n")
-        f.write("="*50 + "\n\n")
+        # Queue metrics
+        self.peak_queue_lengths = {
+            'checkin_regular': {'length': 0, 'time': 0},
+            'checkin_business': {'length': 0, 'time': 0},
+            'security_regular': {'length': 0, 'time': 0},
+            'security_business': {'length': 0, 'time': 0},
+            'boarding': {'length': 0, 'time': 0}
+        }
         
-        # Compare key metrics
-        metrics_to_compare = [
-            "total_passengers",
-            "completed_passengers",
-            "missed_flight_rate",
-            "balking_rate",
-            "reneging_rate",
-            "avg_check_in_time",
-            "avg_security_time",
-            "avg_boarding_time",
-            "avg_total_time",
-            "throughput_per_hour"
-        ]
+        # Wait time tracking
+        self.all_wait_times = {
+            'checkin_regular': [],
+            'checkin_business': [],
+            'security_regular': [],
+            'security_business': [],
+            'boarding': []
+        }
         
-        # Write metric comparison
-        for metric in metrics_to_compare:
-            f.write(f"{metric.replace('_', ' ').title()}:\n")
-            for scenario_name, metrics_collector in results.items():
-                system_metrics = metrics_collector.get_system_metrics()
-                value = system_metrics.get(metric, 0)
+        # SLA tracking
+        self.queue_to_process = {
+            'checkin_regular': 'checkin',
+            'checkin_business': 'checkin',
+            'security_regular': 'security',
+            'security_business': 'security',
+            'boarding': 'boarding'
+        }
+        self.sla_metrics = {
+            'checkin': {'target': 20, 'met': 0, 'total': 0},
+            'security': {'target': 15, 'met': 0, 'total': 0},
+            'boarding': {'target': 10, 'met': 0, 'total': 0}
+        }
+        self.bottleneck_counts = {
+            'checkin_regular': 0,
+            'checkin_business': 0,
+            'security_regular': 0,
+            'security_business': 0,
+            'boarding': 0
+        }
+
+    def update_peak_queue(self, queue_type: str, current_length: int, current_time: float):
+        if current_length > self.peak_queue_lengths[queue_type]['length']:
+            self.peak_queue_lengths[queue_type]['length'] = current_length
+            self.peak_queue_lengths[queue_type]['time'] = current_time
+            
+    def record_wait_time(self, queue_type: str, wait_time: float):
+        self.all_wait_times[queue_type].append(wait_time)
+            
+    def update_sla(self, process: str, wait_time: float):
+        self.sla_metrics[process]['total'] += 1
+        if wait_time <= self.sla_metrics[process]['target']:
+            self.sla_metrics[process]['met'] += 1
+            
+    def get_sla_percentages(self):
+        return {
+            process: (metrics['met'] / metrics['total'] * 100 if metrics['total'] > 0 else 0)
+            for process, metrics in self.sla_metrics.items()
+        }
+        
+    def identify_bottleneck(self):
+        queue_lengths = self.queue_lengths
+        for queue_type in queue_lengths:
+            if queue_lengths[queue_type] and queue_lengths[queue_type][-1] > 0:
+                self.bottleneck_counts[queue_type] += 1
                 
-                if "rate" in metric:
-                    f.write(f"  {scenario_name}: {value:.2%}\n")
-                elif "time" in metric:
-                    f.write(f"  {scenario_name}: {value:.2f} minutes\n")
-                else:
-                    f.write(f"  {scenario_name}: {value}\n")
-            f.write("\n")
-        
-        # Write conclusion
-        f.write("="*50 + "\n")
-        f.write("Conclusion\n")
-        f.write("="*50 + "\n\n")
-        
-        # Compare overall performance
-        best_scenario = min(results.items(), key=lambda x: x[1].get_system_metrics().get("avg_total_time", float('inf')))
-        worst_scenario = max(results.items(), key=lambda x: x[1].get_system_metrics().get("avg_total_time", float('inf')))
-        
-        f.write(f"Best overall performance (lowest average total time): {best_scenario[0]}\n")
-        f.write(f"Worst overall performance (highest average total time): {worst_scenario[0]}\n\n")
-        
-        # Compare missed flight rates
-        best_missed_flight = min(results.items(), key=lambda x: x[1].get_system_metrics().get("missed_flight_rate", float('inf')))
-        worst_missed_flight = max(results.items(), key=lambda x: x[1].get_system_metrics().get("missed_flight_rate", float('inf')))
-        
-        f.write(f"Best missed flight rate: {best_missed_flight[0]} ({best_missed_flight[1].get_system_metrics().get('missed_flight_rate', 0):.2%})\n")
-        f.write(f"Worst missed flight rate: {worst_missed_flight[0]} ({worst_missed_flight[1].get_system_metrics().get('missed_flight_rate', 0):.2%})\n\n")
-        
-        # Compare throughput
-        best_throughput = max(results.items(), key=lambda x: x[1].get_system_metrics().get("throughput_per_hour", 0))
-        worst_throughput = min(results.items(), key=lambda x: x[1].get_system_metrics().get("throughput_per_hour", 0))
-        
-        f.write(f"Best throughput: {best_throughput[0]} ({best_throughput[1].get_system_metrics().get('throughput_per_hour', 0):.2f} passengers/hour)\n")
-        f.write(f"Worst throughput: {worst_throughput[0]} ({worst_throughput[1].get_system_metrics().get('throughput_per_hour', 0):.2f} passengers/hour)\n")
+    def finalize_metrics(self, current_time: float, resources: dict):
+        # Record final wait times for passengers still in queues
+        for queue_type, resource in resources.items():
+            if resource.queue:
+                for req in resource.queue:
+                    wait_time = current_time - req.arrival_time
+                    self.record_wait_time(queue_type, wait_time)
 
-def main():
-    """
-    Main entry point for the simulation.
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Airport Passenger Processing Simulation")
-    parser.add_argument("--scenario", type=str, default="base", help="Scenario to run")
-    parser.add_argument("--all", action="store_true", help="Run all scenarios")
-    parser.add_argument("--output", type=str, default="results", help="Output directory")
-    args = parser.parse_args()
+class AirportSimulation:
+    def __init__(self, config: SimulationConfig):
+        self.env = simpy.Environment()
+        self.config = config
+        self.metrics = Metrics()
+        
+        # Resources
+        self.regular_counters = simpy.Resource(self.env, capacity=config.REGULAR_COUNTERS)
+        self.business_counters = simpy.Resource(self.env, capacity=config.BUSINESS_COUNTERS)
+        self.kiosks = simpy.Resource(self.env, capacity=config.KIOSKS)
+        self.regular_security = simpy.Resource(self.env, capacity=config.REGULAR_SECURITY_LANES)
+        self.business_security = simpy.Resource(self.env, capacity=config.BUSINESS_SECURITY_LANES)
+        self.boarding_gates = simpy.Resource(self.env, capacity=config.BOARDING_GATES)
+
+    def generate_service_time(self, mean_time: float) -> float:
+        return random.expovariate(1.0 / mean_time)
+
+    def checkin_process(self, passenger):
+        is_business = passenger['is_business']
+        has_luggage = passenger['has_luggage']
+
+        if has_luggage or random.random() < 0.3:
+            if is_business:
+                resource = self.business_counters
+                queue_type = 'checkin_business'
+            else:
+                resource = self.regular_counters
+                queue_type = 'checkin_regular'
+            service_time = self.generate_service_time(self.config.CHECKIN_COUNTER_TIME_MEAN)
+        else:
+            resource = self.kiosks
+            queue_type = 'checkin_regular'
+            service_time = self.generate_service_time(self.config.CHECKIN_KIOSK_TIME_MEAN)
+
+        req = resource.request()
+        req.arrival_time = self.env.now
+        yield req
+        wait_time = self.env.now - req.arrival_time
+        self.metrics.record_wait_time(queue_type, wait_time)
+        self.metrics.update_sla(self.metrics.queue_to_process[queue_type], wait_time)
+        yield self.env.timeout(service_time)
+        resource.release(req)
+
+    def security_process(self, passenger):
+        is_business = passenger['is_business']
+        needs_detailed = random.random() < self.config.DETAILED_SECURITY_PROB
+
+        if is_business:
+            resource = self.business_security
+            queue_type = 'security_business'
+        else:
+            resource = self.regular_security
+            queue_type = 'security_regular'
+
+        req = resource.request()
+        req.arrival_time = self.env.now
+        yield req
+        wait_time = self.env.now - req.arrival_time
+        self.metrics.record_wait_time(queue_type, wait_time)
+        self.metrics.update_sla(self.metrics.queue_to_process[queue_type], wait_time)
+        
+        base_time = self.generate_service_time(self.config.SECURITY_TIME_MEAN)
+        if needs_detailed:
+            base_time += self.generate_service_time(self.config.DETAILED_SECURITY_TIME_MEAN)
+        yield self.env.timeout(base_time)
+        resource.release(req)
+
+    def boarding_process(self, passenger):
+        queue_type = 'boarding'
+        resource = self.boarding_gates
+        req = resource.request()
+        req.arrival_time = self.env.now
+        yield req
+        wait_time = self.env.now - req.arrival_time
+        self.metrics.record_wait_time(queue_type, wait_time)
+        self.metrics.update_sla(self.metrics.queue_to_process[queue_type], wait_time)
+        yield self.env.timeout(self.generate_service_time(self.config.BOARDING_TIME_MEAN))
+        resource.release(req)
+
+    def passenger_process(self, id: int):
+        self.metrics.current_passengers += 1
+        arrival_time = self.env.now
+        
+        try:
+            passenger = {
+                'id': id,
+                'is_business': random.random() < self.config.BUSINESS_CLASS_PROB,
+                'has_luggage': random.random() < self.config.LUGGAGE_PROB,
+                'arrival_time': arrival_time
+            }
+
+            # Go through all processes
+            yield from self.checkin_process(passenger)
+            yield from self.security_process(passenger)
+            yield from self.boarding_process(passenger)
+            
+            self.metrics.completed_passengers += 1
+        except simpy.Interrupt:
+            self.metrics.abandoned_passengers += 1
+        finally:
+            self.metrics.current_passengers -= 1
+
+    def record_metrics(self):
+        last_hour_completed = 0
+        last_record_time = 0
+        
+        while True:
+            current_time = self.env.now
+            
+            # Calculate hourly throughput
+            if current_time >= last_record_time + 60:  # Every hour
+                hourly_completed = self.metrics.completed_passengers - last_hour_completed
+                self.metrics.throughput_per_hour.append(hourly_completed)
+                last_hour_completed = self.metrics.completed_passengers
+                last_record_time = current_time
+            
+            self.metrics.timestamps.append(current_time)
+            
+            # Record queue lengths and identify bottlenecks
+            for queue_type, queue_obj in [
+                ('checkin_regular', self.regular_counters),
+                ('checkin_business', self.business_counters),
+                ('security_regular', self.regular_security),
+                ('security_business', self.business_security),
+                ('boarding', self.boarding_gates)
+            ]:
+                queue_length = len(queue_obj.queue)
+                self.metrics.queue_lengths[queue_type].append(queue_length)
+                self.metrics.update_peak_queue(queue_type, queue_length, current_time)
+                
+                # Calculate real-time queue waits using request arrival times
+                if queue_obj.queue:
+                    current_waits = [current_time - req.arrival_time for req in queue_obj.queue]
+                    self.metrics.all_wait_times[queue_type].append(np.mean(current_waits))
+                
+            # Record utilization
+            self.metrics.utilization['regular_counters'].append(len(self.regular_counters.users) / self.config.REGULAR_COUNTERS)
+            self.metrics.utilization['business_counters'].append(len(self.business_counters.users) / self.config.BUSINESS_COUNTERS)
+            self.metrics.utilization['kiosks'].append(len(self.kiosks.users) / self.config.KIOSKS)
+            self.metrics.utilization['regular_security'].append(len(self.regular_security.users) / self.config.REGULAR_SECURITY_LANES)
+            self.metrics.utilization['business_security'].append(len(self.business_security.users) / self.config.BUSINESS_SECURITY_LANES)
+            self.metrics.utilization['boarding'].append(len(self.boarding_gates.users) / self.config.BOARDING_GATES)
+            
+            # Identify bottlenecks
+            self.metrics.identify_bottleneck()
+            
+            yield self.env.timeout(5)  # Record every 5 minutes
+
+    def generate_arrivals(self):
+        i = 0
+        while True:
+            yield self.env.timeout(random.expovariate(1.0 / self.config.MEAN_ARRIVAL_TIME))
+            self.env.process(self.passenger_process(i))
+            i += 1
+
+    def run(self):
+        # Create results directory with timestamp
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.results_dir = os.path.join("results", f"run_{self.timestamp}")
+        os.makedirs(self.results_dir, exist_ok=True)
+        self.env.process(self.generate_arrivals())
+        self.env.process(self.record_metrics())
+        self.env.run(until=self.config.SIMULATION_TIME)
+        
+        # Finalize metrics for passengers still in queues
+        resources = {
+            'checkin_regular': self.regular_counters,
+            'checkin_business': self.business_counters,
+            'security_regular': self.regular_security,
+            'security_business': self.business_security,
+            'boarding': self.boarding_gates
+        }
+        self.metrics.finalize_metrics(self.env.now, resources)
+
+    def save_results(self, scenario_name: str):
+        results = {
+            'scenario': scenario_name,
+            'config': self.config.__dict__,
+            'metrics': {
+                'queue_stats': {
+                    queue: {
+                        'avg_wait': np.mean(waits) if waits else 0,
+                        'max_wait': np.max(waits) if waits else 0
+                    }
+                    for queue, waits in self.metrics.all_wait_times.items()
+                },
+                'avg_queue_lengths': {
+                    queue: np.mean(lengths) 
+                    for queue, lengths in self.metrics.queue_lengths.items()
+                },
+                'avg_utilization': {
+                    resource: np.mean(utils) 
+                    for resource, utils in self.metrics.utilization.items()
+                },
+                'throughput': {
+                    'total_completed': self.metrics.completed_passengers,
+                    'total_abandoned': self.metrics.abandoned_passengers,
+                    'hourly_throughput': self.metrics.throughput_per_hour,
+                    'avg_hourly_throughput': np.mean(self.metrics.throughput_per_hour) if self.metrics.throughput_per_hour else 0
+                },
+                'peak_queues': self.metrics.peak_queue_lengths,
+                'sla_compliance': self.metrics.get_sla_percentages(),
+                'bottlenecks': {
+                    queue: count/len(self.metrics.timestamps) * 100
+                    for queue, count in self.metrics.bottleneck_counts.items()
+                }
+            }
+        }
+        
+        # Save JSON results
+        filename = os.path.join(self.results_dir, f"results_{scenario_name}.json")
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=4)
+        
+        self.plot_metrics(scenario_name, self.results_dir)
+
+    def plot_metrics(self, scenario_name: str, results_dir: str):
+        # Plot queue lengths over time
+        plt.figure(figsize=(12, 6))
+        for queue, lengths in self.metrics.queue_lengths.items():
+            plt.plot(self.metrics.timestamps, lengths, label=queue)
+        plt.xlabel('Time (minutes)')
+        plt.ylabel('Queue Length')
+        plt.title(f'Queue Lengths Over Time - {scenario_name}')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(results_dir, f'queue_lengths_{scenario_name}.png'))
+        plt.close()
+        
+        # Plot utilization over time
+        plt.figure(figsize=(12, 6))
+        for resource, utils in self.metrics.utilization.items():
+            plt.plot(self.metrics.timestamps, utils, label=resource)
+        plt.xlabel('Time (minutes)')
+        plt.ylabel('Utilization Rate')
+        plt.title(f'Resource Utilization Over Time - {scenario_name}')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(results_dir, f'utilization_{scenario_name}.png'))
+        plt.close()
+
+def run_scenario(name: str, config_updates: Dict = None):
+    config = SimulationConfig()
+    if config_updates:
+        for key, value in config_updates.items():
+            setattr(config, key, value)
     
-    # Create timestamp for output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.output, timestamp)
-    
-    # Run simulation
-    if args.all:
-        run_all_scenarios(output_dir)
-    else:
-        run_simulation(args.scenario, output_dir)
+    sim = AirportSimulation(config)
+    sim.run()
+    sim.save_results(name)
 
 if __name__ == "__main__":
-    main() 
+    # Run different scenarios
+    
+    # Base scenario
+    run_scenario("base")
+    
+    # High demand scenario
+    run_scenario("high_demand", {
+        "MEAN_ARRIVAL_TIME": (1/116.67)/2,  
+    })
+    
+    # Low staff scenario
+    run_scenario("low_staff", {
+        "REGULAR_COUNTERS": 200,  
+        "BUSINESS_COUNTERS": 10, 
+        "REGULAR_SECURITY_LANES": 80, 
+        "BUSINESS_SECURITY_LANES": 5, 
+        "BOARDING_GATES": 110
+    })
+    
+    # High staff scenario
+    run_scenario("high_staff", {
+        "REGULAR_COUNTERS": 350, 
+        "BUSINESS_COUNTERS": 25, 
+        "REGULAR_SECURITY_LANES": 140, 
+        "BUSINESS_SECURITY_LANES": 10, 
+        "BOARDING_GATES": 200
+    })
+
+    run_scenario("high_demand_high_staff", {
+        "MEAN_ARRIVAL_TIME": (1/116.67)/2,  
+        "REGULAR_COUNTERS": 550, 
+        "BUSINESS_COUNTERS": 30, 
+        "REGULAR_SECURITY_LANES": 180, 
+        "BUSINESS_SECURITY_LANES": 15, 
+        "BOARDING_GATES": 250
+    })
+
