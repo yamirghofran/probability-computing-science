@@ -36,7 +36,7 @@ class SimulationConfig:
     KIOSKS: int = 90
     REGULAR_SECURITY_LANES: int = 95
     BUSINESS_SECURITY_LANES: int = 10
-    BOARDING_GATES: int = 118
+    BOARDING_GATES: int = 125
 
 class Metrics:
     def __init__(self):
@@ -156,6 +156,7 @@ class AirportSimulation:
         is_business = passenger['is_business']
         has_luggage = passenger['has_luggage']
 
+        # Initial resource selection
         if has_luggage or random.random() < 0.3:
             if is_business:
                 resource = self.business_counters
@@ -171,7 +172,53 @@ class AirportSimulation:
 
         req = resource.request()
         req.arrival_time = self.env.now
-        yield req
+        
+        while True:
+            if (self.env.now - req.arrival_time > 5 and 
+                random.random() < self.config.JOCKEY_PROB):
+                
+                current_queue_length = len(resource.queue)
+                alternative_queues = []
+                
+                if is_business:
+                    if not has_luggage and resource != self.kiosks:
+                        alternative_queues.append(('kiosk', self.kiosks, self.config.CHECKIN_KIOSK_TIME_MEAN))
+                else:
+                    if not has_luggage:
+                        if resource != self.kiosks:
+                            alternative_queues.append(('kiosk', self.kiosks, self.config.CHECKIN_KIOSK_TIME_MEAN))
+                    if resource != self.regular_counters:
+                        alternative_queues.append(('regular', self.regular_counters, self.config.CHECKIN_COUNTER_TIME_MEAN))
+
+                current_expected_wait = current_queue_length * service_time
+                best_queue = None
+                best_wait = current_expected_wait
+                
+                for queue_name, alt_resource, alt_service_time in alternative_queues:
+                    alt_length = len(alt_resource.queue)
+                    alt_wait = alt_length * alt_service_time
+                    
+                    if alt_wait < best_wait * 0.8:
+                        best_queue = alt_resource
+                        best_wait = alt_wait
+                        service_time = alt_service_time
+
+                if best_queue:
+                    if req in resource.queue:
+                        resource.queue.remove(req)
+                    resource = best_queue
+                    req = resource.request()
+                    req.arrival_time = self.env.now
+                    continue
+
+            try:
+                yield req
+                break
+            except simpy.Interrupt:
+                if req in resource.queue:
+                    resource.queue.remove(req)
+                raise
+
         wait_time = self.env.now - req.arrival_time
         self.metrics.record_wait_time(queue_type, wait_time)
         self.metrics.update_sla(self.metrics.queue_to_process[queue_type], wait_time)
@@ -419,7 +466,7 @@ if __name__ == "__main__":
         "MEAN_ARRIVAL_TIME": (1/116.67)/2,  
         "REGULAR_COUNTERS": 550, 
         "BUSINESS_COUNTERS": 30, 
-        "REGULAR_SECURITY_LANES": 180, 
+        "REGULAR_SECURITY_LANES": 190, 
         "BUSINESS_SECURITY_LANES": 15, 
         "BOARDING_GATES": 250
     })
