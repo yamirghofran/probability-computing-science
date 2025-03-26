@@ -169,9 +169,51 @@ class AirportSimulation:
             queue_type = 'checkin_regular'
             service_time = self.generate_service_time(self.config.CHECKIN_KIOSK_TIME_MEAN)
 
+
         req = resource.request()
         req.arrival_time = self.env.now
-        yield req
+        while True:
+            # Check for jockeying before requesting resource
+            if (self.env.now - req.arrival_time > 5 and 
+                random.random() < self.config.JOCKEY_PROB):
+                
+                current_queue_length = len(resource.queue)
+                alternative_queues = []
+                
+                if not is_business:  # Regular passengers
+                    if resource != self.kiosks and not has_luggage:
+                        alternative_queues.append(('kiosk', self.kiosks))
+                    if resource != self.regular_counters:
+                        alternative_queues.append(('regular', self.regular_counters))
+                
+                # Find shortest alternative queue
+                best_queue = None
+                best_length = current_queue_length
+                
+                for queue_name, alt_resource in alternative_queues:
+                    alt_length = len(alt_resource.queue)
+                    if alt_length < best_length * 0.7:  # 30% shorter
+                        best_queue = alt_resource
+                        best_length = alt_length
+                
+                if best_queue:
+                    # Cancel current request if in queue
+                    if req in resource.queue:
+                        resource.queue.remove(req)
+                    # Switch queues
+                    resource = best_queue
+                    req = resource.request()
+                    req.arrival_time = self.env.now
+                    continue
+
+            try:
+                yield req
+                break  # Got the resource, exit loop
+            except simpy.Interrupt:
+                if req in resource.queue:
+                    resource.queue.remove(req)
+                raise
+
         wait_time = self.env.now - req.arrival_time
         self.metrics.record_wait_time(queue_type, wait_time)
         self.metrics.update_sla(self.metrics.queue_to_process[queue_type], wait_time)
